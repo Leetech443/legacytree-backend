@@ -97,6 +97,23 @@ app.put('/api/rsvp/:token', wrap(async (req, res) => {
   res.json({ ok: true, manage_token: r.manage_token });
 }));
 
+/* ---------- Family tree ---------- */
+// Names of minors are sensitive, so the tree is admin-only unless TREE_PUBLIC=true.
+const TREE_PUBLIC = process.env.TREE_PUBLIC === 'true';
+const FAMILY_ROOT_NAME = process.env.FAMILY_ROOT_NAME || 'Mr. Pamba Patelo';
+const isAdminReq = (req) => {
+  try { jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), process.env.JWT_SECRET); return true; } catch { return false; }
+};
+app.get('/api/tree', wrap(async (req, res) => {
+  const admin = isAdminReq(req);
+  if (!admin && !TREE_PUBLIC) return res.status(401).json({ error: 'Sign in as an admin to view the family tree.' });
+  const { rows } = await pool.query(
+    `SELECT m.id, m.full_name AS name, m.generation, m.gender, m.parent_id, m.lineage_side, m.has_children, r.status
+     FROM members m LEFT JOIN rsvps r ON r.member_id = m.id ORDER BY m.full_name`);
+  // RSVP status is only shown to admins
+  res.json({ root: FAMILY_ROOT_NAME, admin, members: rows.map((r) => ({ ...r, status: admin ? r.status : null })) });
+}));
+
 /* ---------- Admin ---------- */
 app.post('/api/admin/login', rateLimit({ windowMs: 15 * 60 * 1000, limit: 10 }), wrap(async (req, res) => {
   const { username = '', password = '' } = req.body || {};
