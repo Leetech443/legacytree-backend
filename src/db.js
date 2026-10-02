@@ -1,9 +1,11 @@
 import 'dotenv/config';
 import pg from 'pg';
 
+pg.types.setTypeParser(1082, (v) => v);
+
 export const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: /@(localhost|127\.0\.0\.1)[:/]/.test(process.env.DATABASE_URL || '') ? false : { rejectUnauthorized: false },
   max: 10,
 });
 

@@ -61,11 +61,12 @@ CREATE TABLE IF NOT EXISTS rsvp_attendance (
   departure_date      DATE NOT NULL,
   travel_method       TEXT NOT NULL REFERENCES travel_methods(code),
   needs_accommodation BOOLEAN NOT NULL,
-  dietary_notes       TEXT,
-  special_assistance  TEXT,
   additional_info     TEXT,
   CHECK (departure_date >= arrival_date)
 );
+
+-- Migration for databases created before these fields were removed
+ALTER TABLE rsvp_attendance DROP COLUMN IF EXISTS dietary_notes, DROP COLUMN IF EXISTS special_assistance;
 
 -- Exists only when status = MAYBE: "ask me again on <date>"
 CREATE TABLE IF NOT EXISTS rsvp_followups (

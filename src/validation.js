@@ -11,8 +11,6 @@ export const attendanceSchema = z.object({
   departure_date: isoDate,
   travel_method: z.string().min(1),
   needs_accommodation: z.boolean(),
-  dietary_notes: text(1000),
-  special_assistance: text(1000),
   additional_info: text(2000),
 }).refine((a) => a.departure_date >= a.arrival_date, { path: ['departure_date'], message: 'Departure must be on/after arrival' });
 

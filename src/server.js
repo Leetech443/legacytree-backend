@@ -15,7 +15,7 @@ app.set('trust proxy', 1); // behind Render's proxy
 app.use(helmet());
 const origins = (process.env.CORS_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
 if (!origins.length) console.warn('CORS_ORIGINS is empty: browsers on other domains (Netlify) will be blocked');
-app.use(cors({ origin: origins, methods: ['GET', 'POST', 'PUT'], maxAge: 86400 }));
+app.use(cors({ origin: origins, methods: ['GET', 'POST', 'PUT', 'DELETE'], maxAge: 86400 }));
 app.use(express.json({ limit: '50kb' }));
 app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, limit: 300 }));
 
@@ -38,7 +38,7 @@ const requireAdmin = (req, res, next) => {
 };
 
 app.get('/', (_, res) => res.json({ service: 'legacytree-api' }));
-app.get('/health', (_, res) => res.json({ ok: true }));
+app.get('/health', (_, res) => res.json({ ok: true, version: '1.3.0' }));
 
 /* ---------- Public ---------- */
 app.get('/api/options', wrap(async (_, res) => {
@@ -52,7 +52,7 @@ app.get('/api/options', wrap(async (_, res) => {
 // Who can be chosen as a parent for a given generation (names only, no contact data)
 const ELIGIBLE = {
   CHILD: `generation='PARENT'`,
-  GRANDCHILD: `(generation='PARENT' OR (generation='CHILD' AND has_children))`,
+  GRANDCHILD: `(generation='CHILD' AND has_children)`,
   GREAT_GRANDCHILD: `(generation='GRANDCHILD' AND has_children)`,
 };
 app.get('/api/parents', wrap(async (req, res) => {
@@ -70,7 +70,7 @@ app.post('/api/register', submitLimiter, wrap(async (req, res) => {
   const out = await tx(async (c) => {
     const { rows: [p] } = await c.query('SELECT id, generation, has_children FROM members WHERE id=$1', [m.parent_id]);
     const ok = p && (m.generation === 'CHILD' ? p.generation === 'PARENT'
-      : m.generation === 'GRANDCHILD' ? p.generation === 'PARENT' || (p.generation === 'CHILD' && p.has_children)
+      : m.generation === 'GRANDCHILD' ? p.generation === 'CHILD' && p.has_children
       : p.generation === 'GRANDCHILD' && p.has_children);
     if (!ok) { const e = new Error('Selected parent is not valid for this generation'); e.status = 400; throw e; }
 
@@ -110,7 +110,7 @@ const ROSTER_SQL = `
   SELECT m.id, m.full_name, m.generation, m.gender, m.lineage_side, m.has_children,
          p.full_name AS parent_name, c.email, c.phone, c.age, c.guardian_name, c.guardian_phone,
          r.status, r.updated_at, a.companions_count, a.arrival_date, a.arrival_time, a.departure_date,
-         tm.label AS travel_method, a.needs_accommodation, a.dietary_notes, a.special_assistance, a.additional_info,
+         tm.label AS travel_method, a.needs_accommodation, a.additional_info, m.created_at, c.school,
          f.remind_on AS followup_date, dr.label AS decline_reason, d.reason_text AS decline_text
   FROM members m
   LEFT JOIN members p ON p.id = m.parent_id
@@ -120,23 +120,38 @@ const ROSTER_SQL = `
   LEFT JOIN travel_methods tm ON tm.code = a.travel_method
   LEFT JOIN rsvp_followups f ON f.rsvp_id = r.id AND f.status = 'PENDING'
   LEFT JOIN rsvp_declines d ON d.rsvp_id = r.id
-  LEFT JOIN decline_reasons dr ON dr.code = d.reason_code`;
+  LEFT JOIN decline_reasons dr ON dr.code = d.reason_code
+  WHERE m.generation <> 'PARENT'`;
 
-app.get('/api/admin/members', requireAdmin, wrap(async (req, res) => {
-  const { generation, status } = req.query;
-  const { rows } = await pool.query(
-    `${ROSTER_SQL} WHERE ($1::generation_t IS NULL OR m.generation=$1) AND ($2::rsvp_status_t IS NULL OR r.status=$2)
-     ORDER BY m.created_at DESC LIMIT 1000`, [generation || null, status || null]);
+app.get('/api/admin/members', requireAdmin, wrap(async (_, res) => {
+  const { rows } = await pool.query(`${ROSTER_SQL} ORDER BY m.created_at DESC LIMIT 5000`);
   res.json(rows);
 }));
 
-app.get('/api/admin/stats', requireAdmin, wrap(async (_, res) => {
-  const { rows } = await pool.query(
-    `SELECT m.generation, COALESCE(r.status::text,'NONE') AS status, count(*)::int AS n,
-            COALESCE(sum(a.companions_count),0)::int AS companions
-     FROM members m LEFT JOIN rsvps r ON r.member_id=m.id LEFT JOIN rsvp_attendance a ON a.rsvp_id=r.id
-     GROUP BY 1,2`);
-  res.json(rows);
+app.delete('/api/admin/members/:id', requireAdmin, wrap(async (req, res) => {
+  try { await pool.query('DELETE FROM members WHERE id=$1', [req.params.id]); }
+  catch (e) {
+    if (e.code === '23503') { const err = new Error('Remove this person\'s registered descendants first.'); err.status = 409; throw err; }
+    throw e;
+  }
+  res.json({ ok: true });
+}));
+
+app.get('/api/admin/overview', requireAdmin, wrap(async (_, res) => {
+  const q = (sql) => pool.query(sql).then((r) => r.rows);
+  const [by_generation, arrivals, travel, lodging, declines, recent, due] = await Promise.all([
+    q(`SELECT m.generation, COALESCE(r.status::text,'NONE') AS status, count(*)::int AS n, COALESCE(sum(a.companions_count),0)::int AS companions
+       FROM members m LEFT JOIN rsvps r ON r.member_id=m.id LEFT JOIN rsvp_attendance a ON a.rsvp_id=r.id
+       WHERE m.generation<>'PARENT' GROUP BY 1,2`),
+    q(`SELECT arrival_date AS date, count(*)::int AS groups, (count(*)+sum(companions_count))::int AS people FROM rsvp_attendance GROUP BY 1 ORDER BY 1`),
+    q(`SELECT tm.label, count(*)::int AS groups, (count(*)+sum(a.companions_count))::int AS people
+       FROM rsvp_attendance a JOIN travel_methods tm ON tm.code=a.travel_method GROUP BY 1 ORDER BY 3 DESC`),
+    q(`SELECT needs_accommodation AS needs, (count(*)+sum(companions_count))::int AS people FROM rsvp_attendance GROUP BY 1`),
+    q(`SELECT dr.label, count(*)::int AS n FROM rsvp_declines d JOIN decline_reasons dr ON dr.code=d.reason_code GROUP BY 1 ORDER BY 2 DESC`),
+    q(`SELECT m.full_name, m.generation, r.status, r.updated_at FROM rsvps r JOIN members m ON m.id=r.member_id ORDER BY r.updated_at DESC LIMIT 8`),
+    q(`SELECT count(*)::int AS n FROM rsvp_followups WHERE status='PENDING' AND remind_on<=CURRENT_DATE`),
+  ]);
+  res.json({ by_generation, arrivals, travel, lodging, declines, recent, followups_due: due[0].n });
 }));
 
 app.get('/api/admin/followups', requireAdmin, wrap(async (req, res) => {
@@ -152,6 +167,14 @@ app.post('/api/admin/followups/:id/done', requireAdmin, wrap(async (req, res) =>
   res.json({ ok: true });
 }));
 
+app.get('/api/admin/parents', requireAdmin, wrap(async (_, res) => {
+  const { rows } = await pool.query(
+    `SELECT m.id, m.full_name, m.gender, m.created_at, c.phone, c.email,
+            (SELECT count(*) FROM members k WHERE k.parent_id = m.id)::int AS children_count
+     FROM members m LEFT JOIN member_contacts c ON c.member_id = m.id
+     WHERE m.generation = 'PARENT' ORDER BY m.full_name`);
+  res.json(rows);
+}));
 app.post('/api/admin/parents', requireAdmin, wrap(async (req, res) => {
   const p = validate(parentSchema, req.body);
   const { rows: [m] } = await pool.query(

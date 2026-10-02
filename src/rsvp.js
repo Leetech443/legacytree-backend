@@ -14,10 +14,10 @@ export async function writeRsvp(c, memberId, rsvp) {
     const a = rsvp.attendance;
     await c.query(
       `INSERT INTO rsvp_attendance (rsvp_id, companions_count, arrival_date, arrival_time, departure_date,
-         travel_method, needs_accommodation, dietary_notes, special_assistance, additional_info)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+         travel_method, needs_accommodation, additional_info)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [r.id, a.companions_count, a.arrival_date, a.arrival_time, a.departure_date, a.travel_method,
-       a.needs_accommodation, a.dietary_notes, a.special_assistance, a.additional_info]);
+       a.needs_accommodation, a.additional_info]);
   } else if (rsvp.status === 'MAYBE') {
     await c.query('INSERT INTO rsvp_followups (rsvp_id, remind_on) VALUES ($1,$2)', [r.id, rsvp.followup_date]);
   } else {
