@@ -38,15 +38,12 @@ const requireAdmin = (req, res, next) => {
 };
 
 app.get('/', (_, res) => res.json({ service: 'legacytree-api' }));
-app.get('/health', (_, res) => res.json({ ok: true, version: '1.3.0' }));
+app.get('/health', (_, res) => res.json({ ok: true, version: '1.4.0' }));
 
 /* ---------- Public ---------- */
 app.get('/api/options', wrap(async (_, res) => {
-  const [t, d] = await Promise.all([
-    pool.query('SELECT code,label FROM travel_methods ORDER BY sort_order'),
-    pool.query('SELECT code,label FROM decline_reasons ORDER BY sort_order'),
-  ]);
-  res.json({ travel_methods: t.rows, decline_reasons: d.rows });
+  const d = await pool.query('SELECT code,label FROM decline_reasons ORDER BY sort_order');
+  res.json({ decline_reasons: d.rows });
 }));
 
 // Who can be chosen as a parent for a given generation (names only, no contact data)
@@ -79,8 +76,12 @@ app.post('/api/register', submitLimiter, wrap(async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
       [m.full_name, m.generation, m.gender, m.parent_id, m.generation === 'CHILD' ? 'Maternal' : m.lineage_side || null, m.has_children]);
     await c.query(
-      `INSERT INTO member_contacts (member_id,email,phone,age,school,guardian_name,guardian_phone) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [mem.id, m.email, m.phone, m.age ?? null, m.school, m.guardian_name, m.guardian_phone]);
+      `INSERT INTO member_contacts (member_id,email,phone,age,guardian_name,guardian_phone) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [mem.id, m.email, m.phone, m.age ?? null, m.guardian_name, m.guardian_phone]);
+    if (m.generation !== 'GREAT_GRANDCHILD') {
+      await c.query('INSERT INTO member_profiles (member_id,occupation,marital_status,spouse_name) VALUES ($1,$2,$3,$4)',
+        [mem.id, m.occupation, m.marital_status, m.marital_status === 'Married' ? m.spouse_name : null]);
+    }
     return { member_id: mem.id, ...(await writeRsvp(c, mem.id, rsvp)) };
   });
   res.status(201).json({ member_id: out.member_id, manage_token: out.manage_token });
@@ -108,10 +109,10 @@ app.get('/api/tree', wrap(async (req, res) => {
   const admin = isAdminReq(req);
   if (!admin && !TREE_PUBLIC) return res.status(401).json({ error: 'Sign in as an admin to view the family tree.' });
   const { rows } = await pool.query(
-    `SELECT m.id, m.full_name AS name, m.generation, m.gender, m.parent_id, m.lineage_side, m.has_children, r.status
-     FROM members m LEFT JOIN rsvps r ON r.member_id = m.id ORDER BY m.full_name`);
+    `SELECT m.id, m.full_name AS name, m.generation, m.gender, m.parent_id, m.lineage_side, m.has_children, r.status, a.friends_count AS friends
+     FROM members m LEFT JOIN rsvps r ON r.member_id = m.id LEFT JOIN rsvp_attendance a ON a.rsvp_id = r.id ORDER BY m.full_name`);
   // RSVP status is only shown to admins
-  res.json({ root: FAMILY_ROOT_NAME, admin, members: rows.map((r) => ({ ...r, status: admin ? r.status : null })) });
+  res.json({ root: FAMILY_ROOT_NAME, admin, members: rows.map((r) => ({ ...r, status: admin ? r.status : null, friends: admin ? r.friends : null })) });
 }));
 
 /* ---------- Admin ---------- */
@@ -124,17 +125,17 @@ app.post('/api/admin/login', rateLimit({ windowMs: 15 * 60 * 1000, limit: 10 }),
 }));
 
 const ROSTER_SQL = `
-  SELECT m.id, m.full_name, m.generation, m.gender, m.lineage_side, m.has_children,
+  SELECT m.id, m.full_name, m.generation, m.gender, m.lineage_side, m.has_children, m.created_at,
          p.full_name AS parent_name, c.email, c.phone, c.age, c.guardian_name, c.guardian_phone,
-         r.status, r.updated_at, a.companions_count, a.arrival_date, a.arrival_time, a.departure_date,
-         tm.label AS travel_method, a.needs_accommodation, a.additional_info, m.created_at, c.school,
+         pr.occupation, pr.marital_status, pr.spouse_name,
+         r.status, r.updated_at, a.friends_count, a.arrival_date,
          f.remind_on AS followup_date, dr.label AS decline_reason, d.reason_text AS decline_text
   FROM members m
   LEFT JOIN members p ON p.id = m.parent_id
   LEFT JOIN member_contacts c ON c.member_id = m.id
+  LEFT JOIN member_profiles pr ON pr.member_id = m.id
   LEFT JOIN rsvps r ON r.member_id = m.id
   LEFT JOIN rsvp_attendance a ON a.rsvp_id = r.id
-  LEFT JOIN travel_methods tm ON tm.code = a.travel_method
   LEFT JOIN rsvp_followups f ON f.rsvp_id = r.id AND f.status = 'PENDING'
   LEFT JOIN rsvp_declines d ON d.rsvp_id = r.id
   LEFT JOIN decline_reasons dr ON dr.code = d.reason_code
@@ -156,19 +157,20 @@ app.delete('/api/admin/members/:id', requireAdmin, wrap(async (req, res) => {
 
 app.get('/api/admin/overview', requireAdmin, wrap(async (_, res) => {
   const q = (sql) => pool.query(sql).then((r) => r.rows);
-  const [by_generation, arrivals, travel, lodging, declines, recent, due] = await Promise.all([
-    q(`SELECT m.generation, COALESCE(r.status::text,'NONE') AS status, count(*)::int AS n, COALESCE(sum(a.companions_count),0)::int AS companions
+  const [by_generation, arrivals, friends_hosts, declines, recent, due] = await Promise.all([
+    q(`SELECT m.generation, COALESCE(r.status::text,'NONE') AS status, count(*)::int AS n, COALESCE(sum(a.friends_count),0)::int AS friends
        FROM members m LEFT JOIN rsvps r ON r.member_id=m.id LEFT JOIN rsvp_attendance a ON a.rsvp_id=r.id
        WHERE m.generation<>'PARENT' GROUP BY 1,2`),
-    q(`SELECT arrival_date AS date, count(*)::int AS groups, (count(*)+sum(companions_count))::int AS people FROM rsvp_attendance GROUP BY 1 ORDER BY 1`),
-    q(`SELECT tm.label, count(*)::int AS groups, (count(*)+sum(a.companions_count))::int AS people
-       FROM rsvp_attendance a JOIN travel_methods tm ON tm.code=a.travel_method GROUP BY 1 ORDER BY 3 DESC`),
-    q(`SELECT needs_accommodation AS needs, (count(*)+sum(companions_count))::int AS people FROM rsvp_attendance GROUP BY 1`),
+    // family = relatives who said yes; friends = family friends they are bringing
+    q(`SELECT arrival_date AS date, count(*)::int AS family, COALESCE(sum(friends_count),0)::int AS friends FROM rsvp_attendance GROUP BY 1 ORDER BY 1`),
+    q(`SELECT m.id, m.full_name, m.generation, p.full_name AS parent_name, a.friends_count AS friends, a.arrival_date
+       FROM rsvp_attendance a JOIN rsvps r ON r.id=a.rsvp_id JOIN members m ON m.id=r.member_id LEFT JOIN members p ON p.id=m.parent_id
+       WHERE a.friends_count > 0 ORDER BY a.friends_count DESC, m.full_name`),
     q(`SELECT dr.label, count(*)::int AS n FROM rsvp_declines d JOIN decline_reasons dr ON dr.code=d.reason_code GROUP BY 1 ORDER BY 2 DESC`),
     q(`SELECT m.full_name, m.generation, r.status, r.updated_at FROM rsvps r JOIN members m ON m.id=r.member_id ORDER BY r.updated_at DESC LIMIT 8`),
     q(`SELECT count(*)::int AS n FROM rsvp_followups WHERE status='PENDING' AND remind_on<=CURRENT_DATE`),
   ]);
-  res.json({ by_generation, arrivals, travel, lodging, declines, recent, followups_due: due[0].n });
+  res.json({ by_generation, arrivals, friends_hosts, declines, recent, followups_due: due[0].n });
 }));
 
 app.get('/api/admin/followups', requireAdmin, wrap(async (req, res) => {
@@ -186,7 +188,7 @@ app.post('/api/admin/followups/:id/done', requireAdmin, wrap(async (req, res) =>
 
 app.get('/api/admin/parents', requireAdmin, wrap(async (_, res) => {
   const { rows } = await pool.query(
-    `SELECT m.id, m.full_name, m.gender, m.created_at, c.phone, c.email,
+    `SELECT m.id, m.full_name, m.created_at, c.phone, c.email,
             (SELECT count(*) FROM members k WHERE k.parent_id = m.id)::int AS children_count
      FROM members m LEFT JOIN member_contacts c ON c.member_id = m.id
      WHERE m.generation = 'PARENT' ORDER BY m.full_name`);
@@ -195,7 +197,7 @@ app.get('/api/admin/parents', requireAdmin, wrap(async (_, res) => {
 app.post('/api/admin/parents', requireAdmin, wrap(async (req, res) => {
   const p = validate(parentSchema, req.body);
   const { rows: [m] } = await pool.query(
-    `INSERT INTO members (full_name, generation, gender, has_children) VALUES ($1,'PARENT',$2,true) RETURNING id`, [p.full_name, p.gender]);
+    `INSERT INTO members (full_name, generation, gender, has_children) VALUES ($1,'PARENT','Female',true) RETURNING id`, [p.full_name]);
   await pool.query('INSERT INTO member_contacts (member_id,email,phone) VALUES ($1,$2,$3)', [m.id, p.email, p.phone]);
   res.status(201).json({ id: m.id });
 }));
