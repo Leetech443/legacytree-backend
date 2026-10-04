@@ -110,10 +110,11 @@ app.get('/api/tree', wrap(async (req, res) => {
   const admin = isAdminReq(req);
   if (!admin && !TREE_PUBLIC) return res.status(401).json({ error: 'Sign in as an admin to view the family tree.' });
   const { rows } = await pool.query(
-    `SELECT m.id, m.full_name AS name, m.generation, m.gender, m.parent_id, m.lineage_side, m.has_children, r.status, a.friends_count AS friends
-     FROM members m LEFT JOIN rsvps r ON r.member_id = m.id LEFT JOIN rsvp_attendance a ON a.rsvp_id = r.id ORDER BY m.full_name`);
-  // RSVP status is only shown to admins
-  res.json({ root: FAMILY_ROOT_NAME, admin, members: rows.map((r) => ({ ...r, status: admin ? r.status : null, friends: admin ? r.friends : null })) });
+    `SELECT m.id, m.full_name AS name, m.generation, m.gender, m.parent_id, m.lineage_side, m.has_children, r.status,
+            CASE WHEN pr.marital_status = 'Married' THEN pr.spouse_name END AS spouse_name
+     FROM members m LEFT JOIN rsvps r ON r.member_id = m.id LEFT JOIN member_profiles pr ON pr.member_id = m.id ORDER BY m.full_name`);
+  // RSVP status is only shown to admins. Friend counts are intentionally never sent to the tree.
+  res.json({ root: FAMILY_ROOT_NAME, admin, members: rows.map((r) => ({ ...r, status: admin ? r.status : null })) });
 }));
 
 /* ---------- Admin ---------- */
