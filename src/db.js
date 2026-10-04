@@ -1,11 +1,14 @@
 import 'dotenv/config';
 import pg from 'pg';
+import { getDatabaseUrl, needsSsl } from './dbUrl.js';
+
+const url = getDatabaseUrl();
 
 pg.types.setTypeParser(1082, (v) => v);
 
 export const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: /@(localhost|127\.0\.0\.1)[:/]/.test(process.env.DATABASE_URL || '') ? false : { rejectUnauthorized: false },
+  connectionString: url,
+  ssl: needsSsl(url) ? { rejectUnauthorized: false } : false,
   max: 10,
 });
 

@@ -3,8 +3,10 @@ import 'dotenv/config';
 import fs from 'node:fs';
 import bcrypt from 'bcryptjs';
 import pg from 'pg';
+import { getDatabaseUrl, needsSsl } from '../src/dbUrl.js';
 
-const client = new pg.Client({ connectionString: process.env.DATABASE_URL, ssl: /@(localhost|127\.0\.0\.1)[:/]/.test(process.env.DATABASE_URL || '') ? false : { rejectUnauthorized: false } });
+const url = getDatabaseUrl();
+const client = new pg.Client({ connectionString: url, ssl: needsSsl(url) ? { rejectUnauthorized: false } : false });
 await client.connect();
 await client.query(fs.readFileSync(new URL('../db/schema.sql', import.meta.url), 'utf8'));
 const { ADMIN_USER, ADMIN_PASSWORD } = process.env;

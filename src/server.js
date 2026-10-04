@@ -7,6 +7,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { pool, tx } from './db.js';
 import { writeRsvp } from './rsvp.js';
+import { startKeepAlive } from './keepAlive.js';
 import { registerSchema, rsvpSchema, parentSchema } from './validation.js';
 
 if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 24) throw new Error('Set a strong JWT_SECRET');
@@ -226,4 +227,7 @@ app.use((err, req, res, _next) => {
 });
 
 const port = process.env.PORT || 5000;
-app.listen(port, () => console.log(`LegacyTree listening on ${port}`));
+app.listen(port, () => {
+  console.log(`LegacyTree listening on ${port}`);
+  startKeepAlive();
+});
