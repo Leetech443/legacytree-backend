@@ -5,6 +5,7 @@ const text = (max) => z.string().trim().max(max).optional().transform((v) => v |
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Invalid date');
 
 export const attendanceSchema = z.object({
+  friends_count: z.coerce.number().int().min(0).max(50).default(0), // FAMILY FRIENDS only, relatives register themselves
   arrival_date: isoDate,
 });
 
@@ -32,8 +33,7 @@ export const memberSchema = z.object({
   age: z.coerce.number().int().min(0).max(120).optional(),
   occupation: text(120),
   marital_status: z.enum(['Single', 'Married', 'Divorced', 'Widowed']).optional(),
-  spouses: z.array(z.string().trim().min(1, 'Name is required').max(200)).max(10).optional(), // wives (men) or husband (women)
-  parent_spouse_id: z.coerce.number().int().positive().optional(), // which wife of the father is my mother
+  spouse_name: text(200),
   guardian_name: text(200),
   guardian_phone: text(50),
 }).superRefine((m, ctx) => {
@@ -41,11 +41,7 @@ export const memberSchema = z.object({
   if (m.generation === 'CHILD') { need('phone'); need('occupation'); need('marital_status'); }
   if (m.generation === 'GRANDCHILD') { need('age'); need('lineage_side'); need('occupation'); need('marital_status'); }
   if (m.generation === 'GREAT_GRANDCHILD') { need('age'); need('lineage_side'); need('guardian_name'); need('guardian_phone'); }
-  if (m.generation !== 'GREAT_GRANDCHILD' && m.marital_status === 'Married') {
-    const n = m.spouses?.length || 0;
-    if (n < 1) ctx.addIssue({ code: 'custom', path: ['spouses'], message: "Spouse's name is required" });
-    if (m.gender === 'Female' && n > 1) ctx.addIssue({ code: 'custom', path: ['spouses'], message: 'Only one husband can be entered' });
-  }
+  if (m.generation !== 'GREAT_GRANDCHILD' && m.marital_status === 'Married') need('spouse_name', "Spouse's name is required");
 });
 
 export const registerSchema = z.object({

@@ -40,25 +40,9 @@ CREATE TABLE IF NOT EXISTS member_profiles (
   member_id      BIGINT PRIMARY KEY REFERENCES members(id) ON DELETE CASCADE,
   occupation     TEXT,
   marital_status TEXT CHECK (marital_status IN ('Single','Married','Divorced','Widowed')),
-  spouse_name    TEXT,   -- DEPRECATED: spouses now live in member_spouses (kept so no data is lost)
+  spouse_name    TEXT,
   CHECK (marital_status = 'Married' OR spouse_name IS NULL)
 );
-
--- Spouses: a man may have several wives (one row each). A woman has at most one husband (enforced by the API).
-CREATE TABLE IF NOT EXISTS member_spouses (
-  id        BIGSERIAL PRIMARY KEY,
-  member_id BIGINT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
-  name      TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 200),
-  position  INT NOT NULL DEFAULT 1,
-  UNIQUE (member_id, position)
-);
--- Which wife of the parent is this person's mother. Only set when the father has MORE than one wife.
-ALTER TABLE members ADD COLUMN IF NOT EXISTS parent_spouse_id BIGINT REFERENCES member_spouses(id) ON DELETE SET NULL;
-CREATE INDEX IF NOT EXISTS idx_members_parent_spouse ON members(parent_spouse_id);
--- Upgrade: move the old single spouse_name (member_profiles) into member_spouses. Safe to re-run.
-INSERT INTO member_spouses (member_id, name, position)
-  SELECT member_id, spouse_name, 1 FROM member_profiles WHERE marital_status = 'Married' AND spouse_name IS NOT NULL
-  ON CONFLICT (member_id, position) DO NOTHING;
 
 -- One RSVP per member
 CREATE TABLE IF NOT EXISTS rsvps (
@@ -71,7 +55,7 @@ CREATE TABLE IF NOT EXISTS rsvps (
 );
 CREATE INDEX IF NOT EXISTS idx_rsvps_status ON rsvps(status);
 
--- Exists only when status = YES. (friends_count is no longer collected; it defaults to 0 and only holds older data.)
+-- Exists only when status = YES. friends_count = FAMILY FRIENDS (not relatives) coming along.
 CREATE TABLE IF NOT EXISTS rsvp_attendance (
   rsvp_id       BIGINT PRIMARY KEY REFERENCES rsvps(id) ON DELETE CASCADE,
   friends_count INT NOT NULL DEFAULT 0 CHECK (friends_count BETWEEN 0 AND 50),
