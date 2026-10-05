@@ -12,8 +12,8 @@ export async function writeRsvp(c, memberId, rsvp) {
 
   if (rsvp.status === 'YES') {
     const a = rsvp.attendance;
-    await c.query('INSERT INTO rsvp_attendance (rsvp_id, friends_count, arrival_date) VALUES ($1,$2,$3)',
-      [r.id, a.friends_count, a.arrival_date]);
+    await c.query('INSERT INTO rsvp_attendance (rsvp_id, arrival_date) VALUES ($1,$2)',
+      [r.id, a.arrival_date]);
   } else if (rsvp.status === 'MAYBE') {
     await c.query('INSERT INTO rsvp_followups (rsvp_id, remind_on) VALUES ($1,$2)', [r.id, rsvp.followup_date]);
   } else {

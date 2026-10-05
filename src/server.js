@@ -155,7 +155,7 @@ const ROSTER_SQL = `
          pr.occupation, pr.marital_status,
          COALESCE((SELECT json_agg(s.name ORDER BY s.position) FROM member_spouses s WHERE s.member_id = m.id), '[]'::json) AS spouses,
          (SELECT s.name FROM member_spouses s WHERE s.id = m.parent_spouse_id) AS mother_name,
-         r.status, r.updated_at, a.friends_count, a.arrival_date,
+         r.status, r.updated_at, a.arrival_date,
          f.remind_on AS followup_date, dr.label AS decline_reason, d.reason_text AS decline_text
   FROM members m
   LEFT JOIN members p ON p.id = m.parent_id
@@ -184,20 +184,16 @@ app.delete('/api/admin/members/:id', requireAdmin, wrap(async (req, res) => {
 
 app.get('/api/admin/overview', requireAdmin, wrap(async (_, res) => {
   const q = (sql) => pool.query(sql).then((r) => r.rows);
-  const [by_generation, arrivals, friends_hosts, declines, recent, due] = await Promise.all([
-    q(`SELECT m.generation, COALESCE(r.status::text,'NONE') AS status, count(*)::int AS n, COALESCE(sum(a.friends_count),0)::int AS friends
-       FROM members m LEFT JOIN rsvps r ON r.member_id=m.id LEFT JOIN rsvp_attendance a ON a.rsvp_id=r.id
+  const [by_generation, arrivals, declines, recent, due] = await Promise.all([
+    q(`SELECT m.generation, COALESCE(r.status::text,'NONE') AS status, count(*)::int AS n
+       FROM members m LEFT JOIN rsvps r ON r.member_id=m.id
        WHERE m.generation<>'PARENT' GROUP BY 1,2`),
-    // family = relatives who said yes; friends = family friends they are bringing
-    q(`SELECT arrival_date AS date, count(*)::int AS family, COALESCE(sum(friends_count),0)::int AS friends FROM rsvp_attendance GROUP BY 1 ORDER BY 1`),
-    q(`SELECT m.id, m.full_name, m.generation, p.full_name AS parent_name, a.friends_count AS friends, a.arrival_date
-       FROM rsvp_attendance a JOIN rsvps r ON r.id=a.rsvp_id JOIN members m ON m.id=r.member_id LEFT JOIN members p ON p.id=m.parent_id
-       WHERE a.friends_count > 0 ORDER BY a.friends_count DESC, m.full_name`),
+    q(`SELECT arrival_date AS date, count(*)::int AS family FROM rsvp_attendance GROUP BY 1 ORDER BY 1`),
     q(`SELECT dr.label, count(*)::int AS n FROM rsvp_declines d JOIN decline_reasons dr ON dr.code=d.reason_code GROUP BY 1 ORDER BY 2 DESC`),
     q(`SELECT m.full_name, m.generation, r.status, r.updated_at FROM rsvps r JOIN members m ON m.id=r.member_id ORDER BY r.updated_at DESC LIMIT 8`),
     q(`SELECT count(*)::int AS n FROM rsvp_followups WHERE status='PENDING' AND remind_on<=CURRENT_DATE`),
   ]);
-  res.json({ by_generation, arrivals, friends_hosts, declines, recent, followups_due: due[0].n });
+  res.json({ by_generation, arrivals, declines, recent, followups_due: due[0].n });
 }));
 
 app.get('/api/admin/followups', requireAdmin, wrap(async (req, res) => {

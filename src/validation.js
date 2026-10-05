@@ -4,9 +4,7 @@ const todayISO = () => new Date().toISOString().slice(0, 10);
 const text = (max) => z.string().trim().max(max).optional().transform((v) => v || null);
 const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Invalid date');
 
-export const attendanceSchema = z.object({
-  arrival_date: isoDate,
-});
+export const attendanceSchema = z.object({ arrival_date: isoDate });
 
 export const rsvpSchema = z.discriminatedUnion('status', [
   z.object({ status: z.literal('YES'), attendance: attendanceSchema }),

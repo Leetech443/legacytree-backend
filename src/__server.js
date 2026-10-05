@@ -39,7 +39,7 @@ const requireAdmin = (req, res, next) => {
 };
 
 app.get('/', (_, res) => res.json({ service: 'legacytree-api' }));
-app.get('/health', (_, res) => res.json({ ok: true, version: '1.4.0' }));
+app.get('/health', (_, res) => res.json({ ok: true, version: '1.5.0' }));
 
 /* ---------- Public ---------- */
 app.get('/api/options', wrap(async (_, res) => {
@@ -49,16 +49,21 @@ app.get('/api/options', wrap(async (_, res) => {
 
 // Who can be chosen as a parent for a given generation (names only, no contact data)
 const ELIGIBLE = {
-  CHILD: `generation='PARENT'`,
-  GRANDCHILD: `(generation='CHILD' AND has_children)`,
-  GREAT_GRANDCHILD: `(generation='GRANDCHILD' AND has_children)`,
+  CHILD: `m.generation='PARENT'`,
+  GRANDCHILD: `(m.generation='CHILD' AND m.has_children)`,
+  GREAT_GRANDCHILD: `(m.generation='GRANDCHILD' AND m.has_children)`,
 };
 app.get('/api/parents', wrap(async (req, res) => {
   const cond = ELIGIBLE[req.query.for];
   if (!cond) return res.status(400).json({ error: 'Invalid "for"' });
   const g = ['Male', 'Female'].includes(req.query.gender) ? req.query.gender : null;
+  // `wives` is only returned for a man with MORE than one wife (needed so the child can choose their mother)
   const { rows } = await pool.query(
-    `SELECT id, full_name, generation FROM members WHERE ${cond} AND ($1::text IS NULL OR gender=$1) ORDER BY full_name`, [g]);
+    `SELECT m.id, m.full_name, m.generation, m.gender,
+       CASE WHEN m.gender = 'Male' THEN
+         (SELECT json_agg(json_build_object('id', s.id, 'name', s.name) ORDER BY s.position)
+          FROM member_spouses s WHERE s.member_id = m.id HAVING count(*) > 1) END AS wives
+     FROM members m WHERE ${cond} AND ($1::text IS NULL OR m.gender = $1) ORDER BY m.full_name`, [g]);
   res.json(rows);
 }));
 
@@ -66,22 +71,38 @@ const submitLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 30 });
 app.post('/api/register', submitLimiter, wrap(async (req, res) => {
   const { member: m, rsvp } = validate(registerSchema, req.body);
   const out = await tx(async (c) => {
-    const { rows: [p] } = await c.query('SELECT id, generation, has_children FROM members WHERE id=$1', [m.parent_id]);
+    const { rows: [p] } = await c.query('SELECT id, generation, has_children, gender FROM members WHERE id=$1', [m.parent_id]);
     const ok = p && (m.generation === 'CHILD' ? p.generation === 'PARENT'
       : m.generation === 'GRANDCHILD' ? p.generation === 'CHILD' && p.has_children
       : p.generation === 'GRANDCHILD' && p.has_children);
     if (!ok) { const e = new Error('Selected parent is not valid for this generation'); e.status = 400; throw e; }
 
+    // If the father has MORE than one wife, the person must say which wife is their mother
+    let motherId = null;
+    if (p.gender === 'Male') {
+      const { rows: wives } = await c.query('SELECT id FROM member_spouses WHERE member_id=$1', [p.id]);
+      if (wives.length > 1) {
+        if (!m.parent_spouse_id) { const e = new Error('Please select which wife is your mother.'); e.status = 400; throw e; }
+        if (!wives.some((w) => String(w.id) === String(m.parent_spouse_id))) { const e = new Error('The selected mother does not belong to this parent.'); e.status = 400; throw e; }
+        motherId = m.parent_spouse_id;
+      }
+    }
+
     const { rows: [mem] } = await c.query(
-      `INSERT INTO members (full_name, generation, gender, parent_id, lineage_side, has_children)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-      [m.full_name, m.generation, m.gender, m.parent_id, m.generation === 'CHILD' ? 'Maternal' : m.lineage_side || null, m.has_children]);
+      `INSERT INTO members (full_name, generation, gender, parent_id, parent_spouse_id, lineage_side, has_children)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+      [m.full_name, m.generation, m.gender, m.parent_id, motherId, m.generation === 'CHILD' ? 'Maternal' : m.lineage_side || null, m.has_children]);
     await c.query(
       `INSERT INTO member_contacts (member_id,email,phone,age,guardian_name,guardian_phone) VALUES ($1,$2,$3,$4,$5,$6)`,
       [mem.id, m.email, m.phone, m.age ?? null, m.guardian_name, m.guardian_phone]);
     if (m.generation !== 'GREAT_GRANDCHILD') {
-      await c.query('INSERT INTO member_profiles (member_id,occupation,marital_status,spouse_name) VALUES ($1,$2,$3,$4)',
-        [mem.id, m.occupation, m.marital_status, m.marital_status === 'Married' ? m.spouse_name : null]);
+      await c.query('INSERT INTO member_profiles (member_id,occupation,marital_status) VALUES ($1,$2,$3)', [mem.id, m.occupation, m.marital_status]);
+      if (m.marital_status === 'Married') {
+        const names = (m.spouses || []).slice(0, m.gender === 'Female' ? 1 : 10);
+        for (let i = 0; i < names.length; i++) {
+          await c.query('INSERT INTO member_spouses (member_id,name,position) VALUES ($1,$2,$3)', [mem.id, names[i], i + 1]);
+        }
+      }
     }
     return { member_id: mem.id, ...(await writeRsvp(c, mem.id, rsvp)) };
   });
@@ -111,8 +132,10 @@ app.get('/api/tree', wrap(async (req, res) => {
   if (!admin && !TREE_PUBLIC) return res.status(401).json({ error: 'Sign in as an admin to view the family tree.' });
   const { rows } = await pool.query(
     `SELECT m.id, m.full_name AS name, m.generation, m.gender, m.parent_id, m.lineage_side, m.has_children, r.status,
-            CASE WHEN pr.marital_status = 'Married' THEN pr.spouse_name END AS spouse_name
-     FROM members m LEFT JOIN rsvps r ON r.member_id = m.id LEFT JOIN member_profiles pr ON pr.member_id = m.id ORDER BY m.full_name`);
+            m.parent_spouse_id,
+            COALESCE((SELECT json_agg(json_build_object('id', s.id, 'name', s.name) ORDER BY s.position)
+                      FROM member_spouses s WHERE s.member_id = m.id), '[]'::json) AS spouses
+     FROM members m LEFT JOIN rsvps r ON r.member_id = m.id ORDER BY m.full_name`);
   // RSVP status is only shown to admins. Friend counts are intentionally never sent to the tree.
   res.json({ root: FAMILY_ROOT_NAME, admin, members: rows.map((r) => ({ ...r, status: admin ? r.status : null })) });
 }));
@@ -129,8 +152,10 @@ app.post('/api/admin/login', rateLimit({ windowMs: 15 * 60 * 1000, limit: 10 }),
 const ROSTER_SQL = `
   SELECT m.id, m.full_name, m.generation, m.gender, m.lineage_side, m.has_children, m.created_at,
          p.full_name AS parent_name, c.email, c.phone, c.age, c.guardian_name, c.guardian_phone,
-         pr.occupation, pr.marital_status, pr.spouse_name,
-         r.status, r.updated_at, a.friends_count, a.arrival_date,
+         pr.occupation, pr.marital_status,
+         COALESCE((SELECT json_agg(s.name ORDER BY s.position) FROM member_spouses s WHERE s.member_id = m.id), '[]'::json) AS spouses,
+         (SELECT s.name FROM member_spouses s WHERE s.id = m.parent_spouse_id) AS mother_name,
+         r.status, r.updated_at, a.arrival_date,
          f.remind_on AS followup_date, dr.label AS decline_reason, d.reason_text AS decline_text
   FROM members m
   LEFT JOIN members p ON p.id = m.parent_id
@@ -159,20 +184,16 @@ app.delete('/api/admin/members/:id', requireAdmin, wrap(async (req, res) => {
 
 app.get('/api/admin/overview', requireAdmin, wrap(async (_, res) => {
   const q = (sql) => pool.query(sql).then((r) => r.rows);
-  const [by_generation, arrivals, friends_hosts, declines, recent, due] = await Promise.all([
-    q(`SELECT m.generation, COALESCE(r.status::text,'NONE') AS status, count(*)::int AS n, COALESCE(sum(a.friends_count),0)::int AS friends
-       FROM members m LEFT JOIN rsvps r ON r.member_id=m.id LEFT JOIN rsvp_attendance a ON a.rsvp_id=r.id
+  const [by_generation, arrivals, declines, recent, due] = await Promise.all([
+    q(`SELECT m.generation, COALESCE(r.status::text,'NONE') AS status, count(*)::int AS n
+       FROM members m LEFT JOIN rsvps r ON r.member_id=m.id
        WHERE m.generation<>'PARENT' GROUP BY 1,2`),
-    // family = relatives who said yes; friends = family friends they are bringing
-    q(`SELECT arrival_date AS date, count(*)::int AS family, COALESCE(sum(friends_count),0)::int AS friends FROM rsvp_attendance GROUP BY 1 ORDER BY 1`),
-    q(`SELECT m.id, m.full_name, m.generation, p.full_name AS parent_name, a.friends_count AS friends, a.arrival_date
-       FROM rsvp_attendance a JOIN rsvps r ON r.id=a.rsvp_id JOIN members m ON m.id=r.member_id LEFT JOIN members p ON p.id=m.parent_id
-       WHERE a.friends_count > 0 ORDER BY a.friends_count DESC, m.full_name`),
+    q(`SELECT arrival_date AS date, count(*)::int AS family FROM rsvp_attendance GROUP BY 1 ORDER BY 1`),
     q(`SELECT dr.label, count(*)::int AS n FROM rsvp_declines d JOIN decline_reasons dr ON dr.code=d.reason_code GROUP BY 1 ORDER BY 2 DESC`),
     q(`SELECT m.full_name, m.generation, r.status, r.updated_at FROM rsvps r JOIN members m ON m.id=r.member_id ORDER BY r.updated_at DESC LIMIT 8`),
     q(`SELECT count(*)::int AS n FROM rsvp_followups WHERE status='PENDING' AND remind_on<=CURRENT_DATE`),
   ]);
-  res.json({ by_generation, arrivals, friends_hosts, declines, recent, followups_due: due[0].n });
+  res.json({ by_generation, arrivals, declines, recent, followups_due: due[0].n });
 }));
 
 app.get('/api/admin/followups', requireAdmin, wrap(async (req, res) => {
@@ -206,7 +227,7 @@ app.post('/api/admin/parents', requireAdmin, wrap(async (req, res) => {
 
 const csvCell = (v) => {
   if (v == null) return '';
-  let s = v instanceof Date ? v.toISOString().slice(0, 10) : String(v);
+  let s = v instanceof Date ? v.toISOString().slice(0, 10) : Array.isArray(v) ? v.join(' | ') : String(v);
   if (/^[=+\-@\t\r]/.test(s)) s = "'" + s; // block spreadsheet formula injection
   return `"${s.replace(/"/g, '""')}"`;
 };
