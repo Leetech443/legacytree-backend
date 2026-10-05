@@ -1,3 +1,10 @@
+import net from 'node:net';
+
+// Node's default is only 250ms per IP address to finish the TCP handshake. Cross-region links
+// (e.g. Render in Oregon -> Neon in Singapore) can take longer, which surfaces as
+// "AggregateError [ETIMEDOUT]". Give each address more time (override with DB_CONNECT_ATTEMPT_MS).
+net.setDefaultAutoSelectFamilyAttemptTimeout?.(Number(process.env.DB_CONNECT_ATTEMPT_MS) || 3000);
+
 // Reads DATABASE_URL and forgives common copy/paste mistakes (psql wrapper, quotes, spaces).
 export function getDatabaseUrl() {
   let u = (process.env.DATABASE_URL || '').trim();
