@@ -40,6 +40,9 @@ async function withRetry(fn) {
 const rawQuery = pool.query.bind(pool);
 pool.query = (...args) => withRetry(() => rawQuery(...args));
 
+/** A pooled connection, retried if the database is slow to answer. */
+export const connect = () => withRetry(() => pool.connect());
+
 /** Run fn inside a transaction; rolls back on any error. */
 export async function tx(fn) {
   const c = await withRetry(() => pool.connect());
