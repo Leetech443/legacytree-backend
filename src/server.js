@@ -5,7 +5,8 @@ import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { pool, tx } from './db.js';
+import { pool, tx, connect } from './db.js';
+import { applySchema } from './migrate.js';
 import { writeRsvp } from './rsvp.js';
 import { startKeepAlive } from './keepAlive.js';
 import { registerSchema, rsvpSchema, parentSchema } from './validation.js';
@@ -39,7 +40,7 @@ const requireAdmin = (req, res, next) => {
 };
 
 app.get('/', (_, res) => res.json({ service: 'legacytree-api' }));
-app.get('/health', (_, res) => res.json({ ok: true, version: '1.5.0' }));
+app.get('/health', (_, res) => res.json({ ok: true, version: '1.6.0' }));
 
 /* ---------- Public ---------- */
 app.get('/api/options', wrap(async (_, res) => {
@@ -63,7 +64,7 @@ app.get('/api/parents', wrap(async (req, res) => {
        CASE WHEN m.gender = 'Male' THEN
          (SELECT json_agg(json_build_object('id', s.id, 'name', s.name) ORDER BY s.position)
           FROM member_spouses s WHERE s.member_id = m.id HAVING count(*) > 1) END AS wives
-     FROM members m WHERE ${cond} AND ($1::text IS NULL OR m.gender = $1) ORDER BY m.full_name`, [g]);
+     FROM members m WHERE ${cond} AND ($1::text IS NULL OR m.gender = $1) ORDER BY m.birth_order NULLS LAST, m.full_name`, [g]);
   res.json(rows);
 }));
 
@@ -89,9 +90,9 @@ app.post('/api/register', submitLimiter, wrap(async (req, res) => {
     }
 
     const { rows: [mem] } = await c.query(
-      `INSERT INTO members (full_name, generation, gender, parent_id, parent_spouse_id, lineage_side, has_children)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-      [m.full_name, m.generation, m.gender, m.parent_id, motherId, m.generation === 'CHILD' ? 'Maternal' : m.lineage_side || null, m.has_children]);
+      `INSERT INTO members (full_name, generation, gender, parent_id, parent_spouse_id, birth_order, lineage_side, has_children)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+      [m.full_name, m.generation, m.gender, m.parent_id, motherId, m.birth_order, m.generation === 'CHILD' ? 'Maternal' : m.lineage_side || null, m.has_children]);
     await c.query(
       `INSERT INTO member_contacts (member_id,email,phone,age,guardian_name,guardian_phone) VALUES ($1,$2,$3,$4,$5,$6)`,
       [mem.id, m.email, m.phone, m.age ?? null, m.guardian_name, m.guardian_phone]);
@@ -132,7 +133,7 @@ app.get('/api/tree', wrap(async (req, res) => {
   if (!admin && !TREE_PUBLIC) return res.status(401).json({ error: 'Sign in as an admin to view the family tree.' });
   const { rows } = await pool.query(
     `SELECT m.id, m.full_name AS name, m.generation, m.gender, m.parent_id, m.lineage_side, m.has_children, r.status,
-            m.parent_spouse_id,
+            m.parent_spouse_id, m.birth_order,
             COALESCE((SELECT json_agg(json_build_object('id', s.id, 'name', s.name) ORDER BY s.position)
                       FROM member_spouses s WHERE s.member_id = m.id), '[]'::json) AS spouses
      FROM members m LEFT JOIN rsvps r ON r.member_id = m.id ORDER BY m.full_name`);
@@ -150,12 +151,12 @@ app.post('/api/admin/login', rateLimit({ windowMs: 15 * 60 * 1000, limit: 10 }),
 }));
 
 const ROSTER_SQL = `
-  SELECT m.id, m.full_name, m.generation, m.gender, m.lineage_side, m.has_children, m.created_at,
+  SELECT m.id, m.full_name, m.generation, m.gender, m.lineage_side, m.has_children, m.birth_order, m.created_at,
          p.full_name AS parent_name, c.email, c.phone, c.age, c.guardian_name, c.guardian_phone,
          pr.occupation, pr.marital_status,
          COALESCE((SELECT json_agg(s.name ORDER BY s.position) FROM member_spouses s WHERE s.member_id = m.id), '[]'::json) AS spouses,
          (SELECT s.name FROM member_spouses s WHERE s.id = m.parent_spouse_id) AS mother_name,
-         r.status, r.updated_at, a.arrival_date,
+         r.status, r.updated_at, a.friends_count, a.arrival_date,
          f.remind_on AS followup_date, dr.label AS decline_reason, d.reason_text AS decline_text
   FROM members m
   LEFT JOIN members p ON p.id = m.parent_id
@@ -184,16 +185,20 @@ app.delete('/api/admin/members/:id', requireAdmin, wrap(async (req, res) => {
 
 app.get('/api/admin/overview', requireAdmin, wrap(async (_, res) => {
   const q = (sql) => pool.query(sql).then((r) => r.rows);
-  const [by_generation, arrivals, declines, recent, due] = await Promise.all([
-    q(`SELECT m.generation, COALESCE(r.status::text,'NONE') AS status, count(*)::int AS n
-       FROM members m LEFT JOIN rsvps r ON r.member_id=m.id
+  const [by_generation, arrivals, friends_hosts, declines, recent, due] = await Promise.all([
+    q(`SELECT m.generation, COALESCE(r.status::text,'NONE') AS status, count(*)::int AS n, COALESCE(sum(a.friends_count),0)::int AS friends
+       FROM members m LEFT JOIN rsvps r ON r.member_id=m.id LEFT JOIN rsvp_attendance a ON a.rsvp_id=r.id
        WHERE m.generation<>'PARENT' GROUP BY 1,2`),
-    q(`SELECT arrival_date AS date, count(*)::int AS family FROM rsvp_attendance GROUP BY 1 ORDER BY 1`),
+    // family = relatives who said yes; friends = family friends they are bringing
+    q(`SELECT arrival_date AS date, count(*)::int AS family, COALESCE(sum(friends_count),0)::int AS friends FROM rsvp_attendance GROUP BY 1 ORDER BY 1`),
+    q(`SELECT m.id, m.full_name, m.generation, p.full_name AS parent_name, a.friends_count AS friends, a.arrival_date
+       FROM rsvp_attendance a JOIN rsvps r ON r.id=a.rsvp_id JOIN members m ON m.id=r.member_id LEFT JOIN members p ON p.id=m.parent_id
+       WHERE a.friends_count > 0 ORDER BY a.friends_count DESC, m.full_name`),
     q(`SELECT dr.label, count(*)::int AS n FROM rsvp_declines d JOIN decline_reasons dr ON dr.code=d.reason_code GROUP BY 1 ORDER BY 2 DESC`),
     q(`SELECT m.full_name, m.generation, r.status, r.updated_at FROM rsvps r JOIN members m ON m.id=r.member_id ORDER BY r.updated_at DESC LIMIT 8`),
     q(`SELECT count(*)::int AS n FROM rsvp_followups WHERE status='PENDING' AND remind_on<=CURRENT_DATE`),
   ]);
-  res.json({ by_generation, arrivals, declines, recent, followups_due: due[0].n });
+  res.json({ by_generation, arrivals, friends_hosts, declines, recent, followups_due: due[0].n });
 }));
 
 app.get('/api/admin/followups', requireAdmin, wrap(async (req, res) => {
@@ -211,16 +216,16 @@ app.post('/api/admin/followups/:id/done', requireAdmin, wrap(async (req, res) =>
 
 app.get('/api/admin/parents', requireAdmin, wrap(async (_, res) => {
   const { rows } = await pool.query(
-    `SELECT m.id, m.full_name, m.created_at, c.phone, c.email,
+    `SELECT m.id, m.full_name, m.birth_order, m.created_at, c.phone, c.email,
             (SELECT count(*) FROM members k WHERE k.parent_id = m.id)::int AS children_count
      FROM members m LEFT JOIN member_contacts c ON c.member_id = m.id
-     WHERE m.generation = 'PARENT' ORDER BY m.full_name`);
+     WHERE m.generation = 'PARENT' ORDER BY m.birth_order NULLS LAST, m.full_name`);
   res.json(rows);
 }));
 app.post('/api/admin/parents', requireAdmin, wrap(async (req, res) => {
   const p = validate(parentSchema, req.body);
   const { rows: [m] } = await pool.query(
-    `INSERT INTO members (full_name, generation, gender, has_children) VALUES ($1,'PARENT','Female',true) RETURNING id`, [p.full_name]);
+    `INSERT INTO members (full_name, generation, gender, has_children, birth_order) VALUES ($1,'PARENT','Female',true,$2) RETURNING id`, [p.full_name, p.birth_order ?? null]);
   await pool.query('INSERT INTO member_contacts (member_id,email,phone) VALUES ($1,$2,$3)', [m.id, p.email, p.phone]);
   res.status(201).json({ id: m.id });
 }));
@@ -247,6 +252,16 @@ app.use((err, req, res, _next) => {
   if (status === 500) console.error(err);
   res.status(status).json({ error: status === 500 ? 'Internal server error' : err.message, details: err.details });
 });
+
+// Bring the database up to date on every start (idempotent, never drops data). Set AUTO_MIGRATE=false to turn off.
+async function migrate() {
+  if (process.env.AUTO_MIGRATE === 'false') return console.log('[db] AUTO_MIGRATE=false, skipping schema update');
+  try {
+    const c = await connect();
+    try { await applySchema(c); console.log('[db] schema is up to date'); } finally { c.release(); }
+  } catch (e) { console.error('[db] could not update the schema automatically:', e.message, '- run "npm run setup" manually'); }
+}
+await migrate();
 
 const port = process.env.PORT || 5000;
 app.listen(port, () => {

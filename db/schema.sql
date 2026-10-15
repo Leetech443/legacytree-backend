@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS member_spouses (
 -- Which wife of the parent is this person's mother. Only set when the father has MORE than one wife.
 ALTER TABLE members ADD COLUMN IF NOT EXISTS parent_spouse_id BIGINT REFERENCES member_spouses(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_members_parent_spouse ON members(parent_spouse_id);
+-- Birth order among siblings (1 = oldest). For the family's mothers it is their order in the family.
+ALTER TABLE members ADD COLUMN IF NOT EXISTS birth_order INT CHECK (birth_order BETWEEN 1 AND 60);
 -- Upgrade: move the old single spouse_name (member_profiles) into member_spouses. Safe to re-run.
 INSERT INTO member_spouses (member_id, name, position)
   SELECT member_id, spouse_name, 1 FROM member_profiles WHERE marital_status = 'Married' AND spouse_name IS NOT NULL
