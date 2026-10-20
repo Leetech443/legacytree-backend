@@ -21,6 +21,7 @@ app.use(cors({ origin: origins, methods: ['GET', 'POST', 'PUT', 'DELETE'], maxAg
 app.use(express.json({ limit: '50kb' }));
 app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, limit: 300 }));
 
+const ordinal = (n) => { const v = n % 100, x = ['th', 'st', 'nd', 'rd']; return n + (x[(v - 20) % 10] || x[v] || x[0]); };
 const wrap = (fn) => (req, res, next) => fn(req, res, next).catch(next);
 const validate = (schema, data) => {
   const r = schema.safeParse(data);
@@ -40,7 +41,7 @@ const requireAdmin = (req, res, next) => {
 };
 
 app.get('/', (_, res) => res.json({ service: 'legacytree-api' }));
-app.get('/health', (_, res) => res.json({ ok: true, version: '1.6.0' }));
+app.get('/health', (_, res) => res.json({ ok: true, version: '1.7.0' }));
 
 /* ---------- Public ---------- */
 app.get('/api/options', wrap(async (_, res) => {
@@ -68,11 +69,22 @@ app.get('/api/parents', wrap(async (req, res) => {
   res.json(rows);
 }));
 
+// Positions already used among one mother's children. Names are deliberately NOT returned (children can be minors).
+app.get('/api/sibling-orders', wrap(async (req, res) => {
+  const pid = Number(req.query.parent_id);
+  const hasSid = req.query.parent_spouse_id !== undefined && req.query.parent_spouse_id !== '';
+  const sid = hasSid ? Number(req.query.parent_spouse_id) : null;
+  if (!Number.isInteger(pid) || pid < 1 || (hasSid && (!Number.isInteger(sid) || sid < 1))) return res.status(400).json({ error: 'Invalid ids' });
+  const { rows } = await pool.query(
+    `SELECT birth_order FROM members WHERE parent_id = $1 AND parent_spouse_id IS NOT DISTINCT FROM $2::bigint AND birth_order IS NOT NULL ORDER BY birth_order`, [pid, sid]);
+  res.json({ taken: rows.map((r) => r.birth_order) });
+}));
+
 const submitLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 30 });
 app.post('/api/register', submitLimiter, wrap(async (req, res) => {
   const { member: m, rsvp } = validate(registerSchema, req.body);
   const out = await tx(async (c) => {
-    const { rows: [p] } = await c.query('SELECT id, generation, has_children, gender FROM members WHERE id=$1', [m.parent_id]);
+    const { rows: [p] } = await c.query('SELECT id, generation, has_children, gender FROM members WHERE id=$1 FOR UPDATE', [m.parent_id]);
     const ok = p && (m.generation === 'CHILD' ? p.generation === 'PARENT'
       : m.generation === 'GRANDCHILD' ? p.generation === 'CHILD' && p.has_children
       : p.generation === 'GRANDCHILD' && p.has_children);
@@ -88,6 +100,11 @@ app.post('/api/register', submitLimiter, wrap(async (req, res) => {
         motherId = m.parent_spouse_id;
       }
     }
+
+    // Each mother has her OWN 1st, 2nd, 3rd...: a position may be used once per (parent, mother)
+    const { rows: taken } = await c.query(
+      'SELECT 1 FROM members WHERE parent_id=$1 AND parent_spouse_id IS NOT DISTINCT FROM $2::bigint AND birth_order=$3', [m.parent_id, motherId, m.birth_order]);
+    if (taken.length) { const e = new Error(`The ${ordinal(m.birth_order)} position is already taken among this mother's children. Please check your order.`); e.status = 409; throw e; }
 
     const { rows: [mem] } = await c.query(
       `INSERT INTO members (full_name, generation, gender, parent_id, parent_spouse_id, birth_order, lineage_side, has_children)
@@ -224,6 +241,10 @@ app.get('/api/admin/parents', requireAdmin, wrap(async (_, res) => {
 }));
 app.post('/api/admin/parents', requireAdmin, wrap(async (req, res) => {
   const p = validate(parentSchema, req.body);
+  if (p.birth_order) {
+    const { rows: dup } = await pool.query("SELECT 1 FROM members WHERE generation = 'PARENT' AND birth_order = $1", [p.birth_order]);
+    if (dup.length) { const e = new Error(`Another mother already has the ${ordinal(p.birth_order)} position.`); e.status = 409; throw e; }
+  }
   const { rows: [m] } = await pool.query(
     `INSERT INTO members (full_name, generation, gender, has_children, birth_order) VALUES ($1,'PARENT','Female',true,$2) RETURNING id`, [p.full_name, p.birth_order ?? null]);
   await pool.query('INSERT INTO member_contacts (member_id,email,phone) VALUES ($1,$2,$3)', [m.id, p.email, p.phone]);
