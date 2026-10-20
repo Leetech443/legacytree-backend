@@ -1,14 +1,14 @@
 // npm run setup -> applies schema.sql and creates/updates the first admin
 import 'dotenv/config';
-import fs from 'node:fs';
 import bcrypt from 'bcryptjs';
 import pg from 'pg';
 import { getDatabaseUrl, needsSsl } from '../src/dbUrl.js';
+import { applySchema } from '../src/migrate.js';
 
 const url = getDatabaseUrl();
 const client = new pg.Client({ connectionString: url, ssl: needsSsl(url) ? { rejectUnauthorized: false } : false });
 await client.connect();
-await client.query(fs.readFileSync(new URL('../db/schema.sql', import.meta.url), 'utf8'));
+await applySchema(client);
 const { ADMIN_USER, ADMIN_PASSWORD } = process.env;
 if (ADMIN_USER && ADMIN_PASSWORD) {
   if (ADMIN_PASSWORD.length < 10) throw new Error('ADMIN_PASSWORD must be at least 10 characters');

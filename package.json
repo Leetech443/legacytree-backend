@@ -2,11 +2,16 @@
   "name": "legacytree-rsvp",
   "version": "1.0.0",
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "setup": "node scripts/setup.js"
+    "setup": "node scripts/setup.js",
+    "check-db": "node scripts/check-db.js",
+    "reset-data": "node scripts/reset-data.js",
+    "restore-data": "node scripts/restore-data.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
