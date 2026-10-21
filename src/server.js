@@ -7,6 +7,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { pool, tx, connect } from './db.js';
 import { applySchema } from './migrate.js';
+import { FILES } from './buildInfo.js';
 import { writeRsvp } from './rsvp.js';
 import { startKeepAlive } from './keepAlive.js';
 import { registerSchema, rsvpSchema, parentSchema } from './validation.js';
@@ -41,7 +42,7 @@ const requireAdmin = (req, res, next) => {
 };
 
 app.get('/', (_, res) => res.json({ service: 'legacytree-api' }));
-app.get('/health', (_, res) => res.json({ ok: true, version: '1.7.0' }));
+app.get('/health', (_, res) => res.json({ ok: true, version: '1.8.0', files: FILES }));
 
 /* ---------- Public ---------- */
 app.get('/api/options', wrap(async (_, res) => {
@@ -83,6 +84,9 @@ app.get('/api/sibling-orders', wrap(async (req, res) => {
 const submitLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 30 });
 app.post('/api/register', submitLimiter, wrap(async (req, res) => {
   const { member: m, rsvp } = validate(registerSchema, req.body);
+  if (!Number.isInteger(m.birth_order)) { // never save a person silently without their order
+    const e = new Error('Birth order was not received. The server files are out of date: redeploy the backend.'); e.status = 400; throw e;
+  }
   const out = await tx(async (c) => {
     const { rows: [p] } = await c.query('SELECT id, generation, has_children, gender FROM members WHERE id=$1 FOR UPDATE', [m.parent_id]);
     const ok = p && (m.generation === 'CHILD' ? p.generation === 'PARENT'
