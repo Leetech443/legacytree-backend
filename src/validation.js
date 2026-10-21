@@ -23,6 +23,7 @@ export const memberSchema = z.object({
   generation: z.enum(['CHILD', 'GRANDCHILD', 'GREAT_GRANDCHILD']),
   gender: z.enum(['Male', 'Female']),
   parent_id: z.coerce.number().int().positive(),
+  birth_order: z.coerce.number().int().min(1).max(60),
   lineage_side: z.enum(['Maternal', 'Paternal']).optional(),
   has_children: z.boolean().default(false),
   email: z.string().trim().email().max(255).optional().or(z.literal('')).transform((v) => v || null), // optional everywhere
