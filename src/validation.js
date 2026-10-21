@@ -56,6 +56,7 @@ export const registerSchema = z.object({
 // Family mothers: always female, so no gender field
 export const parentSchema = z.object({
   full_name: z.string().trim().min(2).max(200),
+  birth_order: z.coerce.number().int().min(1).max(60).optional(),
   phone: text(50),
   email: z.string().trim().email().optional().or(z.literal('')).transform((v) => v || null),
 });
